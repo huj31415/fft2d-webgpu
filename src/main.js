@@ -76,8 +76,21 @@ f32filterable: ${f32filterable}
     label: `${name} texture`
   });
 
-  const source = await loadImageBitmap("./img/Pentagon.png");
-  const sourceTex = device.createTexture({
+  storage.colorMatchingTex = device.createTexture({
+    size: [cie1931_xyz_2deg_360_830.length / 4],
+    dimension: "1d",
+    format: "rgba32float",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    label: "color matching texture"
+  });
+  device.queue.writeTexture(
+    { texture: storage.colorMatchingTex },
+    cie1931_xyz_2deg_360_830.buffer,
+    {}, { width: cie1931_xyz_2deg_360_830.length / 4 }
+  );
+
+  const source = await loadImageBitmap("./img/Double Slit.png");
+  storage.sourceTex = device.createTexture({
     label: "raw image",
     format: 'rgba8unorm',
     size: [source.width, source.height],
@@ -85,17 +98,21 @@ f32filterable: ${f32filterable}
   });
   device.queue.copyExternalImageToTexture(
     { source: source },
-    { texture: sourceTex },
+    { texture: storage.sourceTex },
     { width: source.width, height: source.height },
   );
 
-  const inputTex = newTexture("input");
-  const rowFreqTex = newTexture("rowFreq");
-  const colFreqTex = newTexture("colFreq");
+  storage.inputTex = newTexture("input");
+  storage.rowFreqTex = newTexture("rowFreq");
+  storage.colFreqTex = newTexture("colFreq");
+  storage.finalTex = newTexture("final");
+  const views = Object.fromEntries(
+    Object.entries(storage).filter(([key, value]) => value instanceof GPUTexture).map(([key, texture]) => [key, texture.createView()])
+  );
 
   const uniformBuffer = uni.createBuffer(device);
 
-  const newComputePipeline = (shaderCode, entryPoint = 'main', name = entryPoint) =>
+  const newComputePipeline = (shaderCode, name, entryPoint = "main") =>
     device.createComputePipeline({
       layout: 'auto',
       compute: {
@@ -109,54 +126,68 @@ f32filterable: ${f32filterable}
       label: `${name} compute pipeline`
     });
 
-  const preprocessPipeline = newComputePipeline(imgPreprocessShaderCode, "main", "preprocess");
+  const preprocessPipeline = newComputePipeline(imgPreprocessShaderCode, "preprocess", "main");
 
   const preprocessBindGroup = device.createBindGroup({
     layout: preprocessPipeline.getBindGroupLayout(0),
     entries: [
       // { binding: 0, resource: { buffer: uniformBuffer } },
-      { binding: 1, resource: sourceTex.createView() },
-      { binding: 2, resource: inputTex.createView() },
+      { binding: 1, resource: views.sourceTex },
+      { binding: 2, resource: views.inputTex },
     ],
     label: "preprocess compute bind group"
   });
 
-  const rowComputePipeline = newComputePipeline(computeShaderCode, "rowFFT_r4");
+  const rowComputePipeline = newComputePipeline(computeShaderCode, "row FFT", "rowFFT_r4");
 
   const rowComputeBindGroup = device.createBindGroup({
     layout: rowComputePipeline.getBindGroupLayout(0),
     entries: [
       // { binding: 0, resource: { buffer: uniformBuffer } },
-      { binding: 1, resource: inputTex.createView() },
-      { binding: 2, resource: rowFreqTex.createView() },
+      { binding: 1, resource: views.inputTex },
+      { binding: 2, resource: views.rowFreqTex },
     ],
     label: "rowfft compute bind group"
   });
 
-  const colComputePipeline = newComputePipeline(computeShaderCode, "colFFT_r4");
+  const colComputePipeline = newComputePipeline(computeShaderCode, "column FFT", "colFFT_r4");
 
   const colComputeBindGroup = device.createBindGroup({
     layout: colComputePipeline.getBindGroupLayout(0),
     entries: [
       // { binding: 0, resource: { buffer: uniformBuffer } },
-      { binding: 1, resource: rowFreqTex.createView() },
-      { binding: 2, resource: colFreqTex.createView() },
+      { binding: 1, resource: views.rowFreqTex },
+      { binding: 2, resource: views.colFreqTex },
     ],
     label: "colfft compute bind group"
+  });
+
+  const filter = f32filterable ? "linear" : "nearest";
+  const repeatSampler = device.createSampler({
+    magFilter: "linear",
+    minFilter: "linear",
+    addressModeU: "repeat",
+    addressModeV: "repeat",
+  });
+
+  const dispersionPipeline = newComputePipeline(dispersionShaderCode, "dispersion");
+
+  const dispersionBindGroup = device.createBindGroup({
+    layout: dispersionPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: views.colFreqTex },
+      { binding: 2, resource: views.finalTex },
+      { binding: 3, resource: repeatSampler },
+      { binding: 4, resource: views.colorMatchingTex },
+    ],
+    label: "dispersion compute bind group"
   });
 
 
   const renderModule = device.createShaderModule({
     code: renderShaderCode,
     label: "render module"
-  });
-
-  const filter = f32filterable ? "linear" : "nearest";
-  const sampler = device.createSampler({
-    magFilter: "linear",
-    minFilter: "linear",
-    addressModeU: "repeat",
-    addressModeV: "repeat",
   });
 
   const renderPipeline = device.createRenderPipeline({
@@ -173,11 +204,11 @@ f32filterable: ${f32filterable}
     layout: renderPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: uniformBuffer } },
-      { binding: 1, resource: colFreqTex.createView() },
-      // { binding: 1, resource: inputTex.createView() },
-      // { binding: 1, resource: rowFreqTex.createView() },
-      // { binding: 1, resource: sourceTex.createView() },
-      { binding: 2, resource: sampler },
+      { binding: 1, resource: views.finalTex },
+      // { binding: 1, resource: views.inputTex },
+      // { binding: 1, resource: views.rowFreqTex },
+      // { binding: 1, resource: views.sourceTex },
+      { binding: 2, resource: repeatSampler },
     ],
   });
 
@@ -220,7 +251,7 @@ f32filterable: ${f32filterable}
     const encoder = device.createCommandEncoder();
 
     const computePass = computeTimingHelper.beginComputePass(encoder);
-    for (let i = 0; i < 100; i++) {
+    // for (let i = 0; i < 50; i++) {
       computePass.setPipeline(rowComputePipeline);
       computePass.setBindGroup(0, rowComputeBindGroup);
       computePass.dispatchWorkgroups(1, 1024);
@@ -228,7 +259,10 @@ f32filterable: ${f32filterable}
       computePass.setPipeline(colComputePipeline);
       computePass.setBindGroup(0, colComputeBindGroup);
       computePass.dispatchWorkgroups(1024, 1);
-    }
+    // }
+    computePass.setPipeline(dispersionPipeline);
+    computePass.setBindGroup(0, dispersionBindGroup);
+    computePass.dispatchWorkgroups(Math.ceil(imgSize[0] / 16), Math.ceil(imgSize[1] / 16));
     computePass.end();
 
     const renderPass = renderTimingHelper.beginRenderPass(encoder, renderPassDescriptor);
@@ -255,5 +289,11 @@ f32filterable: ${f32filterable}
   }, 100);
   rafId = requestAnimationFrame(render);
 }
+
+uni.values.start_L.set([380]);
+uni.values.end_L.set([780]);
+uni.values.steps.set([512]);
+uni.values.ref_L.set([550]);
+uni.values.dispMult.set([1]);
 
 main();

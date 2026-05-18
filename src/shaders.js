@@ -129,10 +129,11 @@ fn rowFFT_r4(@builtin(global_invocation_id) gid: vec3u) {
   }
 
   // store combination of r and g FFT output
-  textureStore(freqTex, gid.xy,       vec4f(row[src][swizzle(x0)], 0, 1));
-  textureStore(freqTex, vec2u(x1, y), vec4f(row[src][swizzle(x1)], 0, 1));
-  textureStore(freqTex, vec2u(x2, y), vec4f(row[src][swizzle(x2)], 0, 1));
-  textureStore(freqTex, vec2u(x3, y), vec4f(row[src][swizzle(x3)], 0, 1));
+  let normalizer = 1.0 / f32(N);
+  textureStore(freqTex, gid.xy,       vec4f(row[src][swizzle(x0)] * normalizer, 0, 1));
+  textureStore(freqTex, vec2u(x1, y), vec4f(row[src][swizzle(x1)] * normalizer, 0, 1));
+  textureStore(freqTex, vec2u(x2, y), vec4f(row[src][swizzle(x2)] * normalizer, 0, 1));
+  textureStore(freqTex, vec2u(x3, y), vec4f(row[src][swizzle(x3)] * normalizer, 0, 1));
 }
 
 @compute @workgroup_size(1, N4_1)
@@ -161,60 +162,76 @@ fn colFFT_r4(@builtin(global_invocation_id) gid: vec3u) {
   }
   
   // store combination of r and g FFT output
-  textureStore(freqTex, gid.xy,       vec4f(dot(row[src][swizzle(y0)], row[src][swizzle(y0)])));
-  textureStore(freqTex, vec2u(x, y1), vec4f(dot(row[src][swizzle(y1)], row[src][swizzle(y1)])));
-  textureStore(freqTex, vec2u(x, y2), vec4f(dot(row[src][swizzle(y2)], row[src][swizzle(y2)])));
-  textureStore(freqTex, vec2u(x, y3), vec4f(dot(row[src][swizzle(y3)], row[src][swizzle(y3)])));
+  let normalizer = 1.0 / f32(N);
+  textureStore(freqTex, gid.xy,       vec4f(dot(row[src][swizzle(y0)], row[src][swizzle(y0)]) * normalizer));
+  textureStore(freqTex, vec2u(x, y1), vec4f(dot(row[src][swizzle(y1)], row[src][swizzle(y1)]) * normalizer));
+  textureStore(freqTex, vec2u(x, y2), vec4f(dot(row[src][swizzle(y2)], row[src][swizzle(y2)]) * normalizer));
+  textureStore(freqTex, vec2u(x, y3), vec4f(dot(row[src][swizzle(y3)], row[src][swizzle(y3)]) * normalizer));
 }
 `;
 
 const dispersionShaderCode = /* wgsl */`
 ${uni.uniformStruct}
 
+@group(0) @binding(0) var<uniform> uni: Uniforms;
 @group(0) @binding(1) var freqTex: texture_2d<f32>;
 @group(0) @binding(2) var output: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(3) var texSampler: sampler;
+@group(0) @binding(4) var colorMatchingTex: texture_1d<f32>;
 
-fn linear2srgb(color: vec4f) -> vec4f {
-  let cutoff = color.rgb < vec3f(0.0031308);
-  let higher = 1.055 * pow(color.rgb, vec3f(1.0 / 2.4)) - 0.055;
-  let lower = 12.92 * color.rgb;
-  return vec4f(select(higher, lower, cutoff), color.a);
-}
+// sRGB D65
+const xyz2rgb = mat3x3f(
+ 3.2404542, -1.5371385, -0.4985314,
+-0.9692660,  1.8760108,  0.0415560,
+ 0.0556434, -0.2040259,  1.0572252
+);
+// sRGB D50
+//   3.1338561, -1.6168667, -0.4906146,
+//   -0.9787684,  1.9161415,  0.0334540,
+//   0.0719453, -0.2289914,  1.4052427
+// );
 
 // https://www.baeldung.com/cs/rgb-color-light-frequency
-fn wavelengthToColor(l: f32) -> vec4f {
-  let Xt = vec3f(
-    (l - 442.0) * select(0.0374, 0.0624, l < 442.0),
-    (l - 599.8) * select(0.0323, 0.0264, l < 599.8),
-    (l - 501.1) * select(0.0382, 0.0490, l < 501.1)
-  );
-  let x = dot(exp(-0.5 * Xt * Xt), vec3f(0.362, 1.056, -0.065));
+fn wavelengthToColor(l: f32) -> vec3f {
+  // let Xt = vec3f(
+  //   (l - 442.0) * select(0.0374, 0.0624, l < 442.0),
+  //   (l - 599.8) * select(0.0323, 0.0264, l < 599.8),
+  //   (l - 501.1) * select(0.0382, 0.0490, l < 501.1)
+  // );
+  // let x = dot(exp(-0.5 * Xt * Xt), vec3f(0.362, 1.056, -0.065));
 
-  let Yt = vec2f(
-    (l - 568.8) * select(0.0247, 0.0213, l < 568.8),
-    (l - 530.9) * select(0.0322, 0.0613, l < 530.9)
-  );
-  let y = dot(exp(-0.5 * Yt * Yt), vec2f(0.821, 0.286));
+  // let Yt = vec2f(
+  //   (l - 568.8) * select(0.0247, 0.0213, l < 568.8),
+  //   (l - 530.9) * select(0.0322, 0.0613, l < 530.9)
+  // );
+  // let y = dot(exp(-0.5 * Yt * Yt), vec2f(0.821, 0.286));
   
-  let Zt = vec2f(
-    (l - 437.0) * select(0.0278, 0.0845, l < 437.0),
-    (l - 459.0) * select(0.0725, 0.0385, l < 459.0)
-  );
-  let z = dot(exp(-0.5 * Zt * Zt), vec2f(1.217, 0.681));
+  // let Zt = vec2f(
+  //   (l - 437.0) * select(0.0278, 0.0845, l < 437.0),
+  //   (l - 459.0) * select(0.0725, 0.0385, l < 459.0)
+  // );
+  // let z = dot(exp(-0.5 * Zt * Zt), vec2f(1.217, 0.681));
+  let xyz = textureSampleLevel(colorMatchingTex, texSampler, (l - 360) / (830-360), 0.0).rgb;
 
-  return vec4f(
-     3.2406255 * x - 1.5372080 * y - 0.4986286 * z,
-    -0.9689307 * x + 1.8757561 * y + 0.0415175 * z,
-     0.0557101 * x - 0.2040211 * y + 1.0569959 * z,
-     1.0
-  );
+  return max(vec3f(0), xyz2rgb * saturate(xyz));
 }
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
-  let pos = gid.xy;
-  let value = textureLoad(freqTex, pos, 0).r;
-  textureStore(output, pos, vec4f(value, value, value, 1));
+  let texel = gid.xy;
+  let uv = vec2f(texel) / vec2f(1024.0);
+  var value = vec3f(0.0);
+  var weight = vec3f(0.0);
+  let step = max(1 / uni.steps, (uni.end_L - uni.start_L) / uni.steps);
+  for (var l = uni.start_L; l <= uni.end_L; l += step) {
+    let color = wavelengthToColor(l);
+    weight += color / uni.steps;
+    let scale = uni.ref_L / l;
+    let sample_uv = (uv - 0.5) * (1 + (scale - 1) * uni.dispMult) + 0.5;
+    let sample = textureSampleLevel(freqTex, texSampler, sample_uv+0.5, 0.0).rgb;
+    value += color * sample / uni.steps;
+  }
+  textureStore(output, texel, vec4f(value, 1));
 }
 `;
 
@@ -236,6 +253,13 @@ const pos = array<vec2f, 3>(
   vec2f(-1.0,  3.0)
 );
 
+fn linear2srgb(color: vec4f) -> vec4f {
+  let cutoff = color.rgb < vec3f(0.0031308);
+  let higher = 1.055 * pow(color.rgb, vec3f(1.0 / 2.4)) - 0.055;
+  let lower = 12.92 * color.rgb;
+  return vec4f(select(higher, lower, cutoff), color.a);
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vIdx: u32) -> VertexOut {
   let currentPos = pos[vIdx];
@@ -244,7 +268,7 @@ fn vs(@builtin(vertex_index) vIdx: u32) -> VertexOut {
 
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
-  return log(textureSample(freqTex, texSampler, input.fragCoord * (uni.resolution / uni.resolution.y) + 0.5)) / 1e1;
-  // return (textureSample(freqTex, texSampler, input.fragCoord * (uni.resolution / uni.resolution.y)));
+  // return log(textureSample(freqTex, texSampler, input.fragCoord * (uni.resolution / uni.resolution.y))) / 1e1;
+  return linear2srgb(textureSample(freqTex, texSampler, input.fragCoord * (uni.resolution / uni.resolution.y)) * 1e2);
 }
 `;
