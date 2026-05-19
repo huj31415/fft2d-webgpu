@@ -24,7 +24,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
-const computeShaderCode = /* wgsl */`
+const fftShaderCode = /* wgsl */`
 // enable f16;
 // enable subgroups;
 // can run first log2(subgroup_size) passes with subgroups
@@ -178,60 +178,39 @@ ${uni.uniformStruct}
 @group(0) @binding(2) var output: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(3) var texSampler: sampler;
 @group(0) @binding(4) var colorMatchingTex: texture_1d<f32>;
+@group(0) @binding(5) var d65tex: texture_1d<f32>;
 
+const xyz2rgb = transpose(mat3x3f(
 // sRGB D65
-const xyz2rgb = mat3x3f(
  3.2404542, -1.5371385, -0.4985314,
 -0.9692660,  1.8760108,  0.0415560,
  0.0556434, -0.2040259,  1.0572252
-);
-// sRGB D50
-//   3.1338561, -1.6168667, -0.4906146,
-//   -0.9787684,  1.9161415,  0.0334540,
-//   0.0719453, -0.2289914,  1.4052427
-// );
 
-// https://www.baeldung.com/cs/rgb-color-light-frequency
-fn wavelengthToColor(l: f32) -> vec3f {
-  // let Xt = vec3f(
-  //   (l - 442.0) * select(0.0374, 0.0624, l < 442.0),
-  //   (l - 599.8) * select(0.0323, 0.0264, l < 599.8),
-  //   (l - 501.1) * select(0.0382, 0.0490, l < 501.1)
-  // );
-  // let x = dot(exp(-0.5 * Xt * Xt), vec3f(0.362, 1.056, -0.065));
-
-  // let Yt = vec2f(
-  //   (l - 568.8) * select(0.0247, 0.0213, l < 568.8),
-  //   (l - 530.9) * select(0.0322, 0.0613, l < 530.9)
-  // );
-  // let y = dot(exp(-0.5 * Yt * Yt), vec2f(0.821, 0.286));
-  
-  // let Zt = vec2f(
-  //   (l - 437.0) * select(0.0278, 0.0845, l < 437.0),
-  //   (l - 459.0) * select(0.0725, 0.0385, l < 459.0)
-  // );
-  // let z = dot(exp(-0.5 * Zt * Zt), vec2f(1.217, 0.681));
-  let xyz = textureSampleLevel(colorMatchingTex, texSampler, (l - 360) / (830-360), 0.0).rgb;
-
-  return max(vec3f(0), xyz2rgb * saturate(xyz));
-}
+// CIE E
+//  2.3706743, -0.9000405, -0.4706338,
+// -0.5138850,  1.4253036,  0.0885814,
+//  0.0052982, -0.0146949,  1.0093968
+));
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let texel = gid.xy;
   let uv = vec2f(texel) / vec2f(1024.0);
   var value = vec3f(0.0);
-  var weight = vec3f(0.0);
   let step = max(1 / uni.steps, (uni.end_L - uni.start_L) / uni.steps);
+  
   for (var l = uni.start_L; l <= uni.end_L; l += step) {
-    let color = wavelengthToColor(l);
-    weight += color / uni.steps;
-    let scale = uni.ref_L / l;
-    let sample_uv = (uv - 0.5) * (1 + (scale - 1) * uni.dispMult) + 0.5;
-    let sample = textureSampleLevel(freqTex, texSampler, sample_uv+0.5, 0.0).rgb;
-    value += color * sample / uni.steps;
+    let lookupUV = (l - 360) / (830 - 360);
+    let d65 = textureSampleLevel(d65tex, texSampler, lookupUV, 0.0).r / 100.0;
+    let xyz = textureSampleLevel(colorMatchingTex, texSampler, lookupUV, 0.0).xyz * step * d65;
+
+    let uvScale = mix(1.0, uni.ref_L / l, uni.dispMult);
+    // relative to center, add 0.5 for fftshift
+    let sample_uv = (uv - 0.5) * uvScale / uni.scale + 0.5;
+    let sample = textureSampleLevel(freqTex, texSampler, sample_uv+0.5, 0.0).r;
+    value += xyz * sample * (uvScale * uvScale * uvScale); // account for energy conservation
   }
-  textureStore(output, texel, vec4f(value, 1));
+  textureStore(output, texel, vec4f(max(vec3f(0), xyz2rgb * value), 1));
 }
 `;
 
@@ -260,6 +239,41 @@ fn linear2srgb(color: vec4f) -> vec4f {
   return vec4f(select(higher, lower, cutoff), color.a);
 }
 
+fn AgxDefaultContrastApprox(x: vec3f) -> vec3f {
+	return (((((15.5 * x - 40.14) * x + 31.96) * x - 6.868) * x + 0.4298) * x + 0.1191) * x - 0.00232;		
+}
+
+fn AgxCurve(color: vec3f) -> vec3f {
+	let hev = 14 * 0.5;
+	let midGrey = 0.18;
+	let c = (clamp(log2(color / midGrey), vec3f(-hev), vec3f(hev)) + hev) / 14;
+	return AgxDefaultContrastApprox(c);
+}
+
+fn AgX(c: vec3f) -> vec3f {
+  var color = c;
+	color *= 2.3;
+  // abney effect
+  color *= mat3x3f(
+    0.99999976, -1.26657e-7, -1.29064e-9,
+    1.67316e-8, 0.99999976, -5.32026e-9,
+    -0.00725587, 6.47740e-9, 1.00725580
+  );
+
+	color *= mat3x3f(
+    0.842479062253094, 0.0784335999999992, 0.0792237451477643,
+    0.0423282422610123, 0.878468636469772, 0.0791661274605434,
+    0.0423756549057051, 0.0784336, 0.879142973793104
+  );
+  color = AgxCurve(color);
+	color *= mat3x3f(
+    1.19687900512017, -0.0980208811401368, -0.0990297440797205,
+    -0.0528968517574562, 1.15190312990417, -0.0989611768448433,
+    -0.0529716355144438, -0.0980434501171241, 1.15107367264116
+  );
+	return color;
+}
+
 @vertex
 fn vs(@builtin(vertex_index) vIdx: u32) -> VertexOut {
   let currentPos = pos[vIdx];
@@ -269,6 +283,6 @@ fn vs(@builtin(vertex_index) vIdx: u32) -> VertexOut {
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
   // return log(textureSample(freqTex, texSampler, input.fragCoord * (uni.resolution / uni.resolution.y))) / 1e1;
-  return linear2srgb(textureSample(freqTex, texSampler, input.fragCoord * (uni.resolution / uni.resolution.y)) * 1e2);
+  return (vec4f(AgX(textureSample(freqTex, texSampler, input.fragCoord * uni.resRatio).rgb * uni.gain), 1.0));
 }
 `;

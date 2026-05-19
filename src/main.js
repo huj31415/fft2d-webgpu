@@ -76,8 +76,11 @@ f32filterable: ${f32filterable}
     label: `${name} texture`
   });
 
+  // const colorMatchingData = cie1964_xyz_10deg_360_830;
+  const colorMatchingData = cie1931_xyz_2deg_360_830;
+
   storage.colorMatchingTex = device.createTexture({
-    size: [cie1931_xyz_2deg_360_830.length / 4],
+    size: [colorMatchingData.length / 4],
     dimension: "1d",
     format: "rgba32float",
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
@@ -85,8 +88,21 @@ f32filterable: ${f32filterable}
   });
   device.queue.writeTexture(
     { texture: storage.colorMatchingTex },
-    cie1931_xyz_2deg_360_830.buffer,
-    {}, { width: cie1931_xyz_2deg_360_830.length / 4 }
+    colorMatchingData.buffer,
+    {}, { width: colorMatchingData.length / 4 }
+  );
+
+  storage.whitePointTex = device.createTexture({
+    size: [cieD65_360_830.length],
+    dimension: "1d",
+    format: "r32float",
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    label: "white point texture"
+  });
+  device.queue.writeTexture(
+    { texture: storage.whitePointTex },
+    cieD65_360_830.buffer,
+    {}, { width: cieD65_360_830.length }
   );
 
   const source = await loadImageBitmap("./img/Double Slit.png");
@@ -138,7 +154,7 @@ f32filterable: ${f32filterable}
     label: "preprocess compute bind group"
   });
 
-  const rowComputePipeline = newComputePipeline(computeShaderCode, "row FFT", "rowFFT_r4");
+  const rowComputePipeline = newComputePipeline(fftShaderCode, "row FFT", "rowFFT_r4");
 
   const rowComputeBindGroup = device.createBindGroup({
     layout: rowComputePipeline.getBindGroupLayout(0),
@@ -150,7 +166,7 @@ f32filterable: ${f32filterable}
     label: "rowfft compute bind group"
   });
 
-  const colComputePipeline = newComputePipeline(computeShaderCode, "column FFT", "colFFT_r4");
+  const colComputePipeline = newComputePipeline(fftShaderCode, "column FFT", "colFFT_r4");
 
   const colComputeBindGroup = device.createBindGroup({
     layout: colComputePipeline.getBindGroupLayout(0),
@@ -180,6 +196,7 @@ f32filterable: ${f32filterable}
       { binding: 2, resource: views.finalTex },
       { binding: 3, resource: repeatSampler },
       { binding: 4, resource: views.colorMatchingTex },
+      { binding: 5, resource: views.whitePointTex },
     ],
     label: "dispersion compute bind group"
   });
@@ -224,7 +241,8 @@ f32filterable: ${f32filterable}
   };
   const filterStrength = 50;
 
-  const computeTimingHelper = new TimingHelper(device);
+  const fftComputeTimingHelper = new TimingHelper(device);
+  const dispersionComputeTimingHelper = new TimingHelper(device);
   const renderTimingHelper = new TimingHelper(device);
 
   const encoder = device.createCommandEncoder();
@@ -250,20 +268,22 @@ f32filterable: ${f32filterable}
 
     const encoder = device.createCommandEncoder();
 
-    const computePass = computeTimingHelper.beginComputePass(encoder);
+    const fftComputePass = fftComputeTimingHelper.beginComputePass(encoder);
     // for (let i = 0; i < 50; i++) {
-      computePass.setPipeline(rowComputePipeline);
-      computePass.setBindGroup(0, rowComputeBindGroup);
-      computePass.dispatchWorkgroups(1, 1024);
+      fftComputePass.setPipeline(rowComputePipeline);
+      fftComputePass.setBindGroup(0, rowComputeBindGroup);
+      fftComputePass.dispatchWorkgroups(1, 1024);
 
-      computePass.setPipeline(colComputePipeline);
-      computePass.setBindGroup(0, colComputeBindGroup);
-      computePass.dispatchWorkgroups(1024, 1);
+      fftComputePass.setPipeline(colComputePipeline);
+      fftComputePass.setBindGroup(0, colComputeBindGroup);
+      fftComputePass.dispatchWorkgroups(1024, 1);
     // }
-    computePass.setPipeline(dispersionPipeline);
-    computePass.setBindGroup(0, dispersionBindGroup);
-    computePass.dispatchWorkgroups(Math.ceil(imgSize[0] / 16), Math.ceil(imgSize[1] / 16));
-    computePass.end();
+    fftComputePass.end();
+    const dispersionComputePass = dispersionComputeTimingHelper.beginComputePass(encoder);
+    dispersionComputePass.setPipeline(dispersionPipeline);
+    dispersionComputePass.setBindGroup(0, dispersionBindGroup);
+    dispersionComputePass.dispatchWorkgroups(Math.ceil(imgSize[0] / 16), Math.ceil(imgSize[1] / 16));
+    dispersionComputePass.end();
 
     const renderPass = renderTimingHelper.beginRenderPass(encoder, renderPassDescriptor);
     renderPass.setPipeline(renderPipeline);
@@ -272,7 +292,8 @@ f32filterable: ${f32filterable}
     renderPass.end();
 
     device.queue.submit([encoder.finish()]);
-    computeTimingHelper.getResult().then(gpuTime => computeTime += (gpuTime / 1e6 - computeTime) / filterStrength);
+    fftComputeTimingHelper.getResult().then(gpuTime => computeTime += (gpuTime / 1e6 - computeTime) / filterStrength);
+    dispersionComputeTimingHelper.getResult().then(gpuTime => dispersionTime += (gpuTime / 1e6 - dispersionTime) / filterStrength);
     renderTimingHelper.getResult().then(gpuTime => renderTime += (gpuTime / 1e6 - renderTime) / filterStrength);
 
     jsTime += (performance.now() - startTime - jsTime) / filterStrength;
@@ -284,7 +305,8 @@ f32filterable: ${f32filterable}
     gui.io.fps(fps.toFixed(1));
     gui.io.frameTime(deltaTime.toFixed(2));
     gui.io.jsTime(jsTime.toFixed(2));
-    gui.io.computeTime((computeTime).toFixed(2));
+    gui.io.computeTime(computeTime.toFixed(2));
+    gui.io.dispersionTime(dispersionTime.toFixed(2));
     gui.io.renderTime(renderTime.toFixed(2));
   }, 100);
   rafId = requestAnimationFrame(render);
@@ -295,5 +317,7 @@ uni.values.end_L.set([780]);
 uni.values.steps.set([512]);
 uni.values.ref_L.set([550]);
 uni.values.dispMult.set([1]);
+uni.values.gain.set([1]);
+uni.values.scale.set([1]);
 
 main();
