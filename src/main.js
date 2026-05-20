@@ -1,11 +1,5 @@
-let adapter, device;
 let gpuInfo = false;
 
-async function loadImageBitmap(url) {
-  const res = await fetch(url);
-  const blob = await res.blob();
-  return await createImageBitmap(blob, { colorSpaceConversion: 'none' });
-}
 
 async function main() {
 
@@ -105,7 +99,7 @@ f32filterable: ${f32filterable}
     {}, { width: cieD65_360_830.length }
   );
 
-  const source = await loadImageBitmap("./img/Double Slit.png");
+  const source = await loadImageBitmap("./img/DoubleSlit.png");
   storage.sourceTex = device.createTexture({
     label: "raw image",
     format: 'rgba8unorm',
@@ -142,14 +136,21 @@ f32filterable: ${f32filterable}
       label: `${name} compute pipeline`
     });
 
-  const preprocessPipeline = newComputePipeline(imgPreprocessShaderCode, "preprocess", "main");
+  const clampSampler = device.createSampler({
+    magFilter: "linear",
+    minFilter: "linear",
+    addressModeU: "clamp-to-edge",
+    addressModeV: "clamp-to-edge",
+  });
+  const preprocessPipeline = newComputePipeline(preprocessShaderCode, "preprocess", "main");
 
   const preprocessBindGroup = device.createBindGroup({
     layout: preprocessPipeline.getBindGroupLayout(0),
     entries: [
-      // { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 0, resource: { buffer: uniformBuffer } },
       { binding: 1, resource: views.sourceTex },
       { binding: 2, resource: views.inputTex },
+      { binding: 3, resource: clampSampler },
     ],
     label: "preprocess compute bind group"
   });
@@ -239,20 +240,48 @@ f32filterable: ${f32filterable}
       },
     ]
   };
+  
+  const apertureRenderModule = device.createShaderModule({
+    code: apertureRenderShaderCode,
+    label: "aperture render module"
+  });
+  const apertureRenderPipeline = device.createRenderPipeline({
+    label: 'aperture render pipeline',
+    layout: 'auto',
+    vertex: { module: apertureRenderModule },
+    fragment: {
+      module: apertureRenderModule,
+      targets: [{ format: swapChainFormat }],
+    }
+  });
+  const apertureRenderBindGroup = device.createBindGroup({
+    layout: apertureRenderPipeline.getBindGroupLayout(0),
+    entries: [
+      // { binding: 0, resource: { buffer: uniformBuffer } },
+      { binding: 1, resource: views.inputTex },
+      { binding: 2, resource: repeatSampler },
+    ],
+  });
+  const apertureRenderPassDescriptor = {
+    label: 'aperture render pass',
+    colorAttachments: [
+      {
+        clearValue: [0, 0, 0, 1],
+        loadOp: 'clear',
+        storeOp: 'store',
+      },
+    ]
+  };
+  apertureCtx.configure({
+    device: device,
+    format: swapChainFormat,
+  });
+
   const filterStrength = 50;
 
   const fftComputeTimingHelper = new TimingHelper(device);
   const dispersionComputeTimingHelper = new TimingHelper(device);
   const renderTimingHelper = new TimingHelper(device);
-
-  const encoder = device.createCommandEncoder();
-  const preprocessPass = encoder.beginComputePass();
-  preprocessPass.setPipeline(preprocessPipeline);
-  preprocessPass.setBindGroup(0, preprocessBindGroup);
-  preprocessPass.dispatchWorkgroups(Math.ceil(imgSize[0] / 16), Math.ceil(imgSize[1] / 16));
-  preprocessPass.end();
-  device.queue.submit([encoder.finish()]);
-
 
   function render() {
     const startTime = performance.now();
@@ -261,40 +290,58 @@ f32filterable: ${f32filterable}
     fps += (1e3 / deltaTime - fps) / filterStrength;
     lastFrameTime = startTime;
 
-    const canvasTexture = context.getCurrentTexture();
-    renderPassDescriptor.colorAttachments[0].view = canvasTexture.createView();
+    if (uni.update(device.queue) || runEveryFrame) {
+      const encoder = device.createCommandEncoder();
+      if (updateAperture) {
+        const apertureTexture = apertureCtx.getCurrentTexture();
+        apertureRenderPassDescriptor.colorAttachments[0].view = apertureTexture.createView();
 
-    uni.update(device.queue);
+        const preprocessPass = encoder.beginComputePass();
+        preprocessPass.setPipeline(preprocessPipeline);
+        preprocessPass.setBindGroup(0, preprocessBindGroup);
+        preprocessPass.dispatchWorkgroups(Math.ceil(imgSize[0] / 16), Math.ceil(imgSize[1] / 16));
+        preprocessPass.end();
+        updateAperture = false;
 
-    const encoder = device.createCommandEncoder();
+        const apertureRenderPass = encoder.beginRenderPass(apertureRenderPassDescriptor);
+        apertureRenderPass.setPipeline(apertureRenderPipeline);
+        apertureRenderPass.setBindGroup(0, apertureRenderBindGroup);
+        apertureRenderPass.draw(3);
+        apertureRenderPass.end();
+      }
+      const canvasTexture = context.getCurrentTexture();
+      renderPassDescriptor.colorAttachments[0].view = canvasTexture.createView();
 
-    const fftComputePass = fftComputeTimingHelper.beginComputePass(encoder);
-    // for (let i = 0; i < 50; i++) {
+
+      const fftComputePass = fftComputeTimingHelper.beginComputePass(encoder);
+      
       fftComputePass.setPipeline(rowComputePipeline);
       fftComputePass.setBindGroup(0, rowComputeBindGroup);
-      fftComputePass.dispatchWorkgroups(1, 1024);
-
+      fftComputePass.dispatchWorkgroups(1, 1024, 1);
+      
       fftComputePass.setPipeline(colComputePipeline);
       fftComputePass.setBindGroup(0, colComputeBindGroup);
-      fftComputePass.dispatchWorkgroups(1024, 1);
-    // }
-    fftComputePass.end();
-    const dispersionComputePass = dispersionComputeTimingHelper.beginComputePass(encoder);
-    dispersionComputePass.setPipeline(dispersionPipeline);
-    dispersionComputePass.setBindGroup(0, dispersionBindGroup);
-    dispersionComputePass.dispatchWorkgroups(Math.ceil(imgSize[0] / 16), Math.ceil(imgSize[1] / 16));
-    dispersionComputePass.end();
+      fftComputePass.dispatchWorkgroups(1024, 1, 1);
+      // fftComputePass.dispatchWorkgroups(1, 1024, 1);
+      
+      fftComputePass.end();
+      const dispersionComputePass = dispersionComputeTimingHelper.beginComputePass(encoder);
+      dispersionComputePass.setPipeline(dispersionPipeline);
+      dispersionComputePass.setBindGroup(0, dispersionBindGroup);
+      dispersionComputePass.dispatchWorkgroups(Math.ceil(imgSize[0] / 16), Math.ceil(imgSize[1] / 16), 1);
+      dispersionComputePass.end();
 
-    const renderPass = renderTimingHelper.beginRenderPass(encoder, renderPassDescriptor);
-    renderPass.setPipeline(renderPipeline);
-    renderPass.setBindGroup(0, renderBindGroup);
-    renderPass.draw(3);
-    renderPass.end();
+      const renderPass = renderTimingHelper.beginRenderPass(encoder, renderPassDescriptor);
+      renderPass.setPipeline(renderPipeline);
+      renderPass.setBindGroup(0, renderBindGroup);
+      renderPass.draw(3);
+      renderPass.end();
 
-    device.queue.submit([encoder.finish()]);
-    fftComputeTimingHelper.getResult().then(gpuTime => computeTime += (gpuTime / 1e6 - computeTime) / filterStrength);
-    dispersionComputeTimingHelper.getResult().then(gpuTime => dispersionTime += (gpuTime / 1e6 - dispersionTime) / filterStrength);
-    renderTimingHelper.getResult().then(gpuTime => renderTime += (gpuTime / 1e6 - renderTime) / filterStrength);
+      device.queue.submit([encoder.finish()]);
+      fftComputeTimingHelper.getResult().then(gpuTime => computeTime += (gpuTime / 1e6 - computeTime) / filterStrength);
+      dispersionComputeTimingHelper.getResult().then(gpuTime => dispersionTime += (gpuTime / 1e6 - dispersionTime) / filterStrength);
+      renderTimingHelper.getResult().then(gpuTime => renderTime += (gpuTime / 1e6 - renderTime) / filterStrength);
+    }
 
     jsTime += (performance.now() - startTime - jsTime) / filterStrength;
 
@@ -312,12 +359,19 @@ f32filterable: ${f32filterable}
   rafId = requestAnimationFrame(render);
 }
 
-uni.values.start_L.set([380]);
-uni.values.end_L.set([780]);
-uni.values.steps.set([512]);
-uni.values.ref_L.set([550]);
-uni.values.dispMult.set([1]);
-uni.values.gain.set([1]);
-uni.values.scale.set([1]);
+gui.updateAllVisibility();
+
+uni.set("start_L", [380]);
+uni.set("end_L", [780]);
+uni.set("steps", [512]);
+uni.set("ref_L", [550]);
+uni.set("dispMult", [1]);
+uni.set("gain", [1]);
+uni.set("scale", [1]);
+uni.set("srcScale", [1]);
+uni.set("noiseSize", [64]);
+uni.set("noiseOctaves", [5]);
+uni.set("noiseAmp", [1 / 5]);
+uni.set("widthFactor", [1]);
 
 main();

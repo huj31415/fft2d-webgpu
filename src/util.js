@@ -1,7 +1,7 @@
 
 
 const uni = new Uniforms();
-uni.addUniform("resRatio", "vec2f");    // canvas resolution: x-width, y-height
+uni.addUniform("resolution", "f32");
 uni.addUniform("start_L", "f32");
 uni.addUniform("end_L", "f32");
 uni.addUniform("steps", "f32");
@@ -9,6 +9,13 @@ uni.addUniform("ref_L", "f32");
 uni.addUniform("dispMult", "f32");
 uni.addUniform("gain", "f32");
 uni.addUniform("scale", "f32");
+uni.addUniform("srcScale", "f32");
+uni.addUniform("polygonSides", "f32");
+uni.addUniform("rot", "f32");
+uni.addUniform("noiseSize", "f32");
+uni.addUniform("noiseOctaves", "f32");
+uni.addUniform("noiseAmp", "f32");
+uni.addUniform("widthFactor", "f32");
 
 uni.finalize();
 
@@ -20,10 +27,33 @@ const storage = {
   finalTex: null,
 };
 
-const canvas = document.getElementById("canvas");
+const canvas = document.getElementById("_canvas");
+canvas.style.imageRendering = "pixelated";
 
-const gui = new GUI("2D FFT", canvas);
+const resizeCanvas = (value = window.devicePixelRatio) => {
+  // pixelRatio = value / window.innerHeight || 1;
+  const minDim = Math.min(window.innerWidth, window.innerHeight);
+  canvas.style.width = `${minDim}px`;
+  canvas.style.height = `${minDim}px`;
+  canvas.width = canvas.height = value;
+  uni.set("resolution", [value]);
+  gui.io.res([value, value]);
+}
+
+
+async function loadImageBitmap(url) {
+  const res = await fetch(url);
+  const blob = await res.blob();
+  return await createImageBitmap(blob, { colorSpaceConversion: 'none' });
+}
+
+
+const gui = new GUI("2D FFT Diffraction", canvas);
 const imgSize = [1024, 1024];
+
+let adapter, device;
+let runEveryFrame = false;
+let updateAperture = true;
 
 // Performance section
 gui.addGroup("perf", "Performance");
@@ -35,15 +65,22 @@ gui.addNumericOutput("jsTime", "JS", "ms", 2, "perfL");
 gui.addNumericOutput("computeTime", "FFT", "ms", 2, "perfR");
 gui.addNumericOutput("dispersionTime", "Dispersion", "ms", 2, "perfR");
 gui.addNumericOutput("renderTime", "Render", "ms", 2, "perfR");
+gui.addCheckbox("runEveryFrame", "Run every frame", false, "perf", (value) => runEveryFrame = value);
+gui.addDropdown("canvasResolution", "Canvas resolution", [
+  "1024",
+  "512",
+  "256",
+  "128",
+], "perf", null, (value) => resizeCanvas(parseInt(value)));
 
 gui.addGroup("dispersion", "Dispersion settings");
-gui.addNumericInput("start_L", true, "Start wavelength", { min: 360, max: 820, step: 1, val: 380, float: 0 }, "dispersion", (value) => uni.values.start_L.set([value]));
-gui.addNumericInput("end_L", true, "End wavelength", { min: 370, max: 830, step: 1, val: 780, float: 0 }, "dispersion", (value) => uni.values.end_L.set([value]));
-gui.addNumericInput("steps", true, "Steps", { min: 8, max: 2048, step: 8, val: 512, float: 0 }, "dispersion", (value) => uni.values.steps.set([value]));
-gui.addNumericInput("ref_L", true, "Ref. wavelength", { min: 360, max: 830, step: 5, val: 550, float: 0 }, "dispersion", (value) => uni.values.ref_L.set([value]));
-gui.addNumericInput("dispMult", true, "Strength", { min: 0, max: 2, step: 0.05, val: 1, float: 2 }, "dispersion", (value) => uni.values.dispMult.set([value]));
-gui.addNumericInput("gain", true, "Gain", { min: -5, max: 5, step: 0.1, val: 0, float: 1 }, "dispersion", (value) => uni.values.gain.set([10**value]));
-gui.addNumericInput("scale", true, "Scale", { min: 0, max: 3, step: 0.01, val: 0, float: 2 }, "dispersion", (value) => uni.values.scale.set([10**value]));
+gui.addNumericInput("start_L", true, "Start wavelength", { min: 360, max: 820, step: 1, val: 380, float: 0 }, "dispersion", (value) => uni.set("start_L", [value]));
+gui.addNumericInput("end_L", true, "End wavelength", { min: 370, max: 830, step: 1, val: 780, float: 0 }, "dispersion", (value) => uni.set("end_L", [value]));
+gui.addNumericInput("steps", true, "Steps", { min: 8, max: 1024, step: 8, val: 512, float: 0 }, "dispersion", (value) => uni.set("steps", [value]));
+gui.addNumericInput("ref_L", true, "Ref. wavelength", { min: 360, max: 830, step: 5, val: 550, float: 0 }, "dispersion", (value) => uni.set("ref_L", [value]));
+gui.addNumericInput("dispMult", true, "Strength", { min: 0, max: 2, step: 0.05, val: 1, float: 2 }, "dispersion", (value) => uni.set("dispMult", [value]));
+gui.addNumericInput("gain", true, "Gain", { min: -5, max: 5, step: 0.1, val: 0, float: 1 }, "dispersion", (value) => uni.set("gain", [10**value]));
+gui.addNumericInput("scale", true, "Scale", { min: 0, max: 3, step: 0.01, val: 0, float: 2 }, "dispersion", (value) => uni.set("scale", [10**value]));
 
 gui.addDropdown("colorMatching", "Color matching", [
   "CIE 1931 2deg",
@@ -56,6 +93,74 @@ gui.addDropdown("colorMatching", "Color matching", [
     {}, { width: colorMatchingData.length / 4 }
   );
 });
+
+gui.addGroup("source", "Source visualization");
+gui.addDropdown("aperture", "Aperture shape", [
+  "DoubleSlit",
+  "Polygon",
+  "Square",
+  "RoundSquare",
+  "Rhombus",
+  "Pentagon",
+  "HexBand",
+  "RectangleV",
+  "RoundOctagon",
+  "Window",
+  "RoundWindow",
+  "Bahtinov",
+  "Bahtinov2",
+  "JWST",
+  "Oval"
+], "source", { "Polygon": ["polygonSides", "rotation"] }, async (value) => {
+  if (value != "Polygon" && device) {
+    const source = await loadImageBitmap(`./img/${value}.png`);
+    device.queue.copyExternalImageToTexture(
+      { source },
+      { texture: storage.sourceTex },
+      { width: source.width, height: source.height },
+    );
+    uni.set("polygonSides", [0]);
+  } else if (value === "Polygon") {
+    uni.set("polygonSides", [parseInt(gui.io.polygonSides.value)]);
+  }
+  updateAperture = true;
+});
+gui.addNumericInput("polygonSides", true, "Polygon sides", { min: 3, max: 24, step: 1, val: 6, float: 0 }, "source", (value) => {
+  uni.set("polygonSides", [value]);
+  updateAperture = true;
+});
+gui.addNumericInput("rotation", true, "Polygon rotation", { min: 0, max: 360, step: 1, val: 0, float: 0 }, "source", (value) => {
+  uni.set("rot", [value * Math.PI / 180]);
+  updateAperture = true;
+});
+gui.addCheckbox("addNoise", "Add noise", true, "source", (value) => {
+  uni.set("noiseSize", [value ? 2**gui.io.noiseSize.value : 0]);
+  updateAperture = true;
+});
+gui.addNumericInput("noiseSize", true, "Noise size", { min: 0, max: 10, step: 1, val: 5, float: 0 }, "source", (value) => {
+  uni.set("noiseSize", [2**value]);
+  updateAperture = true;
+});
+gui.addNumericInput("noiseOctaves", true, "Noise octaves", { min: 1, max: 10, step: 1, val: 5, float: 0 }, "source", (value) => {
+  uni.set("noiseOctaves", [value]);
+  updateAperture = true;
+});
+gui.addNumericInput("noiseAmp", true, "Noise amplitude", { min: 1, max: 10, step: 1, val: 5, float: 0 }, "source", (value) => {
+  uni.set("noiseAmp", [1 / (11 - value)]);
+  updateAperture = true;
+});
+gui.addNumericInput("widthFactor", true, "Width factor", { min: 0.1, max: 10, step: 0.1, val: 1, float: 1 }, "source", (value) => {
+  uni.set("widthFactor", [value]);
+  updateAperture = true;
+});
+gui.addNumericInput("srcScale", true, "Source scale", { min: -2, max: 2, step: 0.01, val: 0, float: 2 }, "source", (value) => {
+  uni.set("srcScale", [10**value]);
+  updateAperture = true;
+});
+
+
+const apertureCtx = gui.addCanvas("sourceCanvas", "Aperture", {}, 1, 1, "webgpu", "source");
+
 
 // Extra info
 gui.addGroup("guiControls", "GUI controls", `
@@ -79,16 +184,7 @@ let jsTime = 0, lastFrameTime = performance.now(), deltaTime = 10, fps = 0,
   computeTime = 0, dispersionTime = 0, renderTime = 0;
 
 // handle resizing
-window.onresize = window.onload = () => {
-  pixelRatio = window.devicePixelRatio || 1;
-  // canvas.style.zoom = 1 / pixelRatio;
-  canvas.width = window.innerWidth * pixelRatio;
-  canvas.height = window.innerHeight * pixelRatio;
-  // uni.values.resolution.set([canvas.width, canvas.height]);
-  const invMinRes = 1 / Math.min(canvas.width, canvas.height);
-  uni.values.resRatio.set([canvas.width * invMinRes, canvas.height * invMinRes]);
-  gui.io.res([canvas.width, canvas.height]);
-};
+window.onresize = window.onload = () => resizeCanvas(1024);
 
 
 // let rgbmatrix = [
@@ -129,7 +225,7 @@ window.onresize = window.onload = () => {
 //   integratedCIE[1] += rgb[1] / 100;
 //   integratedCIE[2] += rgb[2] / 100;
 // }
-// uni.values.integratedCIE.set(integratedCIE);
+// uni.set("integratedCIE", integratedCIE);
 
 // // compute reference white balance
 // let refColor = new Float32Array(3);
@@ -155,4 +251,4 @@ window.onresize = window.onload = () => {
 // // whiteBalance corrects it back to (1,1,1)
 // const whiteBalance = refWeight.map((w, i) => w / refColor[i]);
 // console.log("White balance gains:", whiteBalance);
-// uni.values.integratedCIE.set(whiteBalance)
+// uni.set("integratedCIE", whiteBalance)

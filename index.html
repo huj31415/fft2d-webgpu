@@ -5,10 +5,17 @@
   <meta charset="UTF-8">
   <title>2D FFT on WebGPU</title>
   <link rel="stylesheet" href="../shared/style.css">
+  <style>
+    #_canvas {
+      position: fixed;
+      left: 0;
+      top: 0;
+    }
+  </style>
 </head>
 
 <body>
-  <canvas id="canvas"></canvas>
+  <canvas id="_canvas"></canvas>
 
   <script src="../shared/gui.js"></script>
   <script src="../shared/gpuTiming.js"></script>
