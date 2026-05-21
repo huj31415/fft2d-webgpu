@@ -195,10 +195,10 @@ fn rowFFT_r4(@builtin(global_invocation_id) gid: vec3u) {
   let x3 = x2 + N4_1;
 
   // load rg as real and imag
-  row[0][swizzle(x0)] = vec2f(textureLoad(input, (vec2u(x0, y)), 0).rg);
-  row[0][swizzle(x1)] = vec2f(textureLoad(input, (vec2u(x1, y)), 0).rg);
-  row[0][swizzle(x2)] = vec2f(textureLoad(input, (vec2u(x2, y)), 0).rg);
-  row[0][swizzle(x3)] = vec2f(textureLoad(input, (vec2u(x3, y)), 0).rg);
+  row[0][swizzle(x0)] = textureLoad(input, (vec2u(x0, y)), 0).rg;
+  row[0][swizzle(x1)] = textureLoad(input, (vec2u(x1, y)), 0).rg;
+  row[0][swizzle(x2)] = textureLoad(input, (vec2u(x2, y)), 0).rg;
+  row[0][swizzle(x3)] = textureLoad(input, (vec2u(x3, y)), 0).rg;
   workgroupBarrier();
 
   // first src is idx 0
@@ -209,7 +209,7 @@ fn rowFFT_r4(@builtin(global_invocation_id) gid: vec3u) {
     workgroupBarrier();
   }
 
-  // store combination of r and g FFT output
+  // store combination of r and g FFT output (transposed)
   let normalizer = 1.0 / f32(N);
   textureStore(freqTex, gid.xy,       vec4f(row[src][swizzle(x0)] * normalizer, 0, 1));
   textureStore(freqTex, vec2u(x1, y), vec4f(row[src][swizzle(x1)] * normalizer, 0, 1));
@@ -249,6 +249,199 @@ fn colFFT_r4(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
+
+const CTfftShaderCode = /* wgsl */`
+// enable f16;
+// enable subgroups;
+// can run first log_SIZE(subgroup_size) passes with subgroups
+
+${uni.uniformStruct}
+
+@group(0) @binding(0) var<uniform> uni: Uniforms;
+@group(0) @binding(1) var input: texture_2d<f32>;
+@group(0) @binding(2) var freqTex: texture_storage_2d<rgba32float, write>;
+
+const PI = 3.14159265359;
+const TAU = 6.28318530718;
+const N = 1024u;    // (image + kernel - 1), power of 4
+const N4_1 = N >> 2u; // N / 4
+const N4_2 = N4_1 * 2u;
+const N4_3 = N4_1 * 3u;
+
+override INV: f32; // 1 for forward FFT, -1 for inverse FFT
+
+var<workgroup> row: array<vec2f, 1024>;
+
+fn cmul(a: vec2f, b: vec2f) -> vec2f {
+  return vec2f(a.x * b.x - a.y * b.y, dot(a, b.yx));
+}
+
+fn swizzle(linear_index: u32) -> u32 {
+  // Take the block identifier (bits above the bank size) 
+  // and XOR it into the lower bank bits
+  // Reconstruct the index with the scrambled bank bits
+  return (linear_index & ~31u) | ((linear_index & 31u) ^ ((linear_index >> 5u) & 31u));
+}
+
+// fn fftR2(x: u32, Ns: u32, i: u32) -> vec2f {
+//   let halfNs = Ns / 2;
+//   let base = x / Ns * halfNs;
+//   let offset = x % halfNs;
+//   let x0 = base + offset;
+//   let x1 = x0 + (N >> 1u);
+//   let c0 = row[x0];
+//   let c1 = row[x1];
+//   let angle = -TAU * (f32(x) / f32(Ns));
+//   let cT = vec2f(cos(angle), sin(angle));
+//   return c0 + cmul(cT, c1);
+// }
+
+// fn fftR2_prepass(x: u32, i: u32) {
+//   let t0 = row[x];
+//   let t1 = row[x + (N >> 1u)];
+//   row[x * 2u]      = t0 + t1;
+//   row[x * 2u + 1u] = t0 - t1;
+// }
+
+fn digit_reverse4(x: u32) -> u32 {
+  return ((x & 3u) << 8u) | ((x & 12u) << 4u) | (x & 48u) | ((x & 192u) >> 4u) | ((x >> 8u) & 3u);
+}
+
+fn fftR4_cooleytukey(x: u32, Ns: u32) {
+  let Ns4 = Ns >> 2u; // Ns / 4
+  let offset = x & (Ns4 - 1u); // x % Ns4;
+
+  let base = x / Ns4 * Ns + offset; // floor(x / Ns4) * Ns + offset;
+  let i0 = swizzle(base);
+  let i1 = swizzle(base + Ns4);
+  let i2 = swizzle(base + Ns4 * 2u);
+  let i3 = swizzle(base + Ns4 * 3u);
+
+  // replace with shared memory LUT
+  let angle = -INV * TAU * (f32(offset) / f32(Ns));
+  let w1 = vec2f(cos(angle), sin(angle));
+
+  let t0 =          row[i0];
+  let t1 = cmul(w1, row[i1]);
+  let w2 = cmul(w1, w1);
+  let t2 = cmul(w2, row[i2]);
+  let w3 = cmul(w2, w1);
+  let t3 = cmul(w3, row[i3]);
+
+  row[i0] = t0 + t1 + t2 + t3;
+  row[i1] = t0 + vec2f(t1.y, -t1.x) * INV - t2 + vec2f(-t3.y, t3.x) * INV;
+  row[i2] = t0 - t1 + t2 - t3;
+  row[i3] = t0 + vec2f(-t1.y, t1.x) * INV - t2 + vec2f(t3.y, -t3.x) * INV;
+}
+
+@compute @workgroup_size(N4_1)
+fn rowFFT_r4(@builtin(global_invocation_id) gid: vec3u) {
+  let y = gid.y;  // 0 to N
+  let x0 = gid.x; // 0 to N/4
+  let x1 = x0 + N4_1;
+  let x2 = x1 + N4_1;
+  let x3 = x2 + N4_1;
+
+  var t0 = textureLoad(input, (vec2u(x0, y)), 0);
+  var t1 = textureLoad(input, (vec2u(x1, y)), 0);
+  var t2 = textureLoad(input, (vec2u(x2, y)), 0);
+  var t3 = textureLoad(input, (vec2u(x3, y)), 0);
+
+  // load rg as real and imag
+  row[swizzle(digit_reverse4(x0))] = t0.rg;
+  row[swizzle(digit_reverse4(x1))] = t1.rg;
+  row[swizzle(digit_reverse4(x2))] = t2.rg;
+  row[swizzle(digit_reverse4(x3))] = t3.rg;
+  workgroupBarrier();
+
+  for (var Ns = 4u; Ns <= N; Ns <<= 2u) {
+    fftR4_cooleytukey(x0, Ns);
+    workgroupBarrier();
+  }
+  // store combination of r and g FFT output (transposed)
+  // let normalizer = 1.0 / f32(N);
+  // textureStore(freqTex, gid.yx,       vec4f(t0.rg, row[swizzle(x0)]) * normalizer);
+  // textureStore(freqTex, vec2u(y, x1), vec4f(t1.rg, row[swizzle(x1)]) * normalizer);
+  // textureStore(freqTex, vec2u(y, x2), vec4f(t2.rg, row[swizzle(x2)]) * normalizer);
+  // textureStore(freqTex, vec2u(y, x3), vec4f(t3.rg, row[swizzle(x3)]) * normalizer);
+
+  // store rg fft output, can just use swizzle assignment in glsl
+  t0 = vec4f(row[swizzle(x0)], t0.ba);
+  t1 = vec4f(row[swizzle(x1)], t1.ba);
+  t2 = vec4f(row[swizzle(x2)], t2.ba);
+  t3 = vec4f(row[swizzle(x3)], t3.ba);
+  workgroupBarrier();
+
+  // load ba as real and imag
+  row[swizzle(digit_reverse4(x0))] = t0.ba;
+  row[swizzle(digit_reverse4(x1))] = t1.ba;
+  row[swizzle(digit_reverse4(x2))] = t2.ba;
+  row[swizzle(digit_reverse4(x3))] = t3.ba;
+  workgroupBarrier();
+
+  // could do this at same time as first pass but with double workgroup memory
+  for (var Ns = 4u; Ns <= N; Ns <<= 2u) {
+    fftR4_cooleytukey(x0, Ns);
+    workgroupBarrier();
+  }
+
+  // store combination of r and g FFT output (transposed)
+  let normalizer = select(1.0 / f32(N), 1.0, INV == 1);
+  textureStore(freqTex, gid.yx,       vec4f(t0.rg, row[swizzle(x0)]) * normalizer);
+  textureStore(freqTex, vec2u(y, x1), vec4f(t1.rg, row[swizzle(x1)]) * normalizer);
+  textureStore(freqTex, vec2u(y, x2), vec4f(t2.rg, row[swizzle(x2)]) * normalizer);
+  textureStore(freqTex, vec2u(y, x3), vec4f(t3.rg, row[swizzle(x3)]) * normalizer);
+}
+`;
+
+// find the total energy in rgb for normalization
+const normalizationShaderCode = /* wgsl */`
+${uni.uniformStruct}
+
+@group(0) @binding(0) var<storage, read> input: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> output: array<atomic<u32>, 3>; // r g b
+
+const arraySize = 1024u * 1024u; // N * N
+const blockSize = 1024u;
+var<workgroup> wgShared: array<vec4f, blockSize>;
+
+@compute @workgroup_size(blockSize)
+fn main(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  // @builtin(workgroup_id) wid: vec3u,
+  @builtin(num_workgroups) nwg: vec3u
+) {
+  let lidx = lid.x;
+  var i = gid.x;
+  var acc = vec4f(0.0);
+  let stride = blockSize * nwg.x;
+  while (i < arraySize) {
+    acc += input[i];
+    i += stride;
+  }
+  wgShared[lidx] = acc;
+
+  workgroupBarrier();
+
+  // parallel reduction to find totals across each channel
+  for (var s = blockSize / 2u; s > 0u; s >>= 1u) {
+    if (lidx < s) {
+      wgShared[lidx] += wgShared[lidx + s];
+    }
+    workgroupBarrier();
+  }
+  if (lidx == 0u) {
+    let total = vec3f(wgShared[0].rgb);
+    atomicMax(&output[0], bitcast<u32>(total.r));
+    atomicMax(&output[1], bitcast<u32>(total.g));
+    atomicMax(&output[2], bitcast<u32>(total.b));
+  }
+}
+`;
+
+
+
 const dispersionShaderCode = /* wgsl */`
 ${uni.uniformStruct}
 
@@ -258,6 +451,7 @@ ${uni.uniformStruct}
 @group(0) @binding(3) var texSampler: sampler;
 @group(0) @binding(4) var colorMatchingTex: texture_1d<f32>;
 @group(0) @binding(5) var d65tex: texture_1d<f32>;
+@group(0) @binding(6) var<uniform> normalization: vec3u;
 
 const xyz2rgb = transpose(mat3x3f(
 // sRGB D65
@@ -277,6 +471,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let uv = vec2f(texel) / vec2f(1024.0);
   var value = vec3f(0.0);
   let step = max(1 / uni.steps, (uni.end_L - uni.start_L) / uni.steps);
+  let normalizationValue = select(bitcast<vec3f>(normalization), vec3f(1.0), all(normalization == vec3u(0))); // doesn't work
   
   for (var l = uni.start_L; l <= uni.end_L; l += step) {
     let lookupUV = (l - 360) / (830 - 360);
@@ -286,14 +481,16 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let uvScale = mix(1.0, uni.ref_L / l, uni.dispMult);
     // relative to center, add 0.5 for fftshift
     let sample_uv = (uv - 0.5) * uvScale / uni.scale + 0.5;
-    let sample = textureSampleLevel(freqTex, texSampler, sample_uv + 0.5 * (1 + 1 / 1024.0), 0.0).rgb;
-    value += xyz * sample * (uvScale * uvScale * uvScale); // account for energy conservation
+    let sample = textureSampleLevel(freqTex, texSampler, sample_uv + 0.5 * (1 + 1 / 1024.0), 0.0).rgb / max(normalizationValue, vec3f(1));
+    value += xyz * sample.r * (uvScale * uvScale * uvScale); // account for energy conservation
+    // value += xyz * dot(sample * 1024, sample) * (uvScale * uvScale * uvScale); // for transposed
   }
-  textureStore(output, texel, vec4f(max(vec3f(0), xyz2rgb * value), 1));
+  let texLoc = select(texel, (texel + 512) & vec2u(1023), uni.FFTshift == 0.0);
+  textureStore(output, texLoc, vec4f(max(vec3f(0), xyz2rgb * value), 1));
 }
 `;
 
-const renderShaderCode = /* wgsl */`
+const AgXRenderShaderCode = /* wgsl */`
 ${uni.uniformStruct}
 
 @group(0) @binding(0) var<uniform> uni: Uniforms;
@@ -362,11 +559,11 @@ fn vs(@builtin(vertex_index) vIdx: u32) -> VertexOut {
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
   // return log(textureSample(freqTex, texSampler, input.fragCoord * (uni.resolution / uni.resolution.y))) / 1e1;
-  return (vec4f(AgX(textureSample(freqTex, texSampler, input.fragCoord).rgb * uni.gain), 1.0));
+  return max(vec4f(0), vec4f(AgX(textureSample(freqTex, texSampler, input.fragCoord).rgb * uni.gain), 1.0));
 }
 `;
 
-const apertureRenderShaderCode = /* wgsl */`
+const directRenderShaderCode = /* wgsl */`
 ${uni.uniformStruct}
 
 // @group(0) @binding(0) var<uniform> uni: Uniforms;

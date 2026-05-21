@@ -16,6 +16,7 @@ uni.addUniform("noiseSize", "f32");
 uni.addUniform("noiseOctaves", "f32");
 uni.addUniform("noiseAmp", "f32");
 uni.addUniform("widthFactor", "f32");
+uni.addUniform("FFTshift", "f32");
 
 uni.finalize();
 
@@ -54,6 +55,10 @@ const imgSize = [1024, 1024];
 let adapter, device;
 let runEveryFrame = false;
 let updateAperture = true;
+let runIFFT = false;
+let normalize = false;
+
+let downloadImg = () => {};
 
 // Performance section
 gui.addGroup("perf", "Performance");
@@ -66,12 +71,24 @@ gui.addNumericOutput("computeTime", "FFT", "ms", 2, "perfR");
 gui.addNumericOutput("dispersionTime", "Dispersion", "ms", 2, "perfR");
 gui.addNumericOutput("renderTime", "Render", "ms", 2, "perfR");
 gui.addCheckbox("runEveryFrame", "Run every frame", false, "perf", (value) => runEveryFrame = value);
+gui.addCheckbox("runFFTIFFT", "Run RGBA FFT/IFFT", false, "perf", (value) => runIFFT = value);
+gui.addCheckbox("fftshift", "FFTshift", true, "perf", (value) => uni.set("FFTshift", [value ? 1 : 0]));
+gui.addCheckbox("normalize", "Normalize output", false, "perf", (value) => {
+  if (!device) return;
+  normalize = value;
+  if (!value) {
+    const zeroData = new Uint8Array([0, 0, 0, 0]);
+    device.queue.writeBuffer(storage.normalizationBuffer, 0, zeroData.buffer, 0, zeroData.byteLength);
+  }
+  uni.valuesChanged = true;
+});
 gui.addDropdown("canvasResolution", "Canvas resolution", [
   "1024",
   "512",
   "256",
   "128",
 ], "perf", null, (value) => resizeCanvas(parseInt(value)));
+gui.addButton("download", "Download image", true, "perf", () => downloadImg());
 
 gui.addGroup("dispersion", "Dispersion settings");
 gui.addNumericInput("start_L", true, "Start wavelength", { min: 360, max: 820, step: 1, val: 380, float: 0 }, "dispersion", (value) => uni.set("start_L", [value]));
